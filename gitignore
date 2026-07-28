@@ -1,0 +1,15 @@
+# secrets / local-only config
+config.json
+.env
+
+# runtime state (per-guild tracking data) — don't ship your live data to git,
+# and don't rely on it surviving in git either since Railway won't read state
+# back out of the repo. Use a Railway Volume for persistence instead.
+guilds.json
+last_versions.json
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
