@@ -1,0 +1,15 @@
+# secrets — never commit, set BOT_TOKEN as a Railway/shell env var instead
+.env
+
+# runtime state (per-guild tracking data). Railway's filesystem is ephemeral
+# on redeploy, so this file doesn't survive there anyway unless you attach a
+# Volume and point DATA_DIR at its mount path — either way it doesn't belong
+# in git.
+guilds.json
+last_versions.json
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
