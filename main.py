@@ -175,8 +175,17 @@ class GraphQLClient:
             self._session = aiohttp.ClientSession(timeout=self._timeout)
         try:
             async with self._session.post(GQL_URL, data=payload) as r:
-                r.raise_for_status()
-                return await r.json(content_type=None)
+                body_text = await r.text()
+                if r.status >= 400:
+                    # Log the real error Meta sent back (invalid/expired token,
+                    # bad doc_id, etc.) instead of throwing it away with
+                    # raise_for_status(), which only gives a bare status code.
+                    print(
+                        f"[GQL] HTTP {r.status} doc_id={payload.get('doc_id')} "
+                        f"app_id={payload.get('variables')}: {body_text[:500]}"
+                    )
+                    return None
+                return json.loads(body_text) if body_text else None
         except Exception as e:
             print(f"[GQL] {type(e).__name__}: {e}")
             if self._session and not self._session.closed:
