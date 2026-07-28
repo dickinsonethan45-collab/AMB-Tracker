@@ -46,36 +46,26 @@ def _as_int(v: Any, default: int = 0) -> int:
         return default
 
 
-# config.json (local dev, gitignored) is the fallback; real environment
-# variables (Railway "Shared Variables" / service Variables tab) always win.
-# This means the exact same code runs unmodified in both places.
-_file_cfg = load_json(CONFIG_PATH, {})
+# config.json is committed to the repo and holds everything except the bot
+# token. Only BOT_TOKEN comes from a Railway Variable (or shell env var
+# locally), since a live bot token is the one credential that's an instant
+# full account takeover if leaked.
+cfg = load_json(CONFIG_PATH, {})
 
-
-def _cfg(env_key: str, json_key: str, default: Any = None) -> Any:
-    if env_key in os.environ and os.environ[env_key] != "":
-        return os.environ[env_key]
-    return _file_cfg.get(json_key, default)
-
-
-ACCESS_TOKEN: str = _cfg("ACCESS_TOKEN", "ACCESS_TOKEN", "")
-BOT_TOKEN: str    = _cfg("BOT_TOKEN", "BotToken", "")
+ACCESS_TOKEN: str = cfg.get("ACCESS_TOKEN", "")
+BOT_TOKEN: str    = os.environ.get("BOT_TOKEN", "")
 
 if not BOT_TOKEN:
     raise SystemExit(
         "No bot token found. Set the BOT_TOKEN environment variable "
-        "(Railway Variables tab), or add \"BotToken\" to a local config.json."
+        "(Railway Variables tab, or `export BOT_TOKEN=...` locally)."
     )
 
-CHECK_INTERVAL: int = _as_int(_cfg("CHECK_INTERVAL", "CheckInterval"), 60)
-
-_owner_ids_raw = _cfg("OWNER_IDS", "OwnerIDs", [])
-if isinstance(_owner_ids_raw, str):
-    _owner_ids_raw = [x.strip() for x in _owner_ids_raw.split(",") if x.strip()]
-OWNER_IDS: set[int] = {int(x) for x in _owner_ids_raw}
+CHECK_INTERVAL: int = _as_int(cfg.get("CheckInterval"), 60)
+OWNER_IDS: set[int] = {int(x) for x in cfg.get("OwnerIDs", [])}
 
 GQL_URL = "https://graph.oculus.com/graphql"
-VERSION_DOC_ID = _cfg("DOC_ID", "DocID", 6771539532935162)
+VERSION_DOC_ID = cfg.get("DocID", 6771539532935162)
 
 # How many consecutive polls must report the same new version before it's
 # treated as a real update. Meta's CDN edges can serve slightly stale/ahead
@@ -83,7 +73,7 @@ VERSION_DOC_ID = _cfg("DOC_ID", "DocID", 6771539532935162)
 # see version A again, then B again — announcing on every poll turns one
 # real update into several. Requiring N consecutive matching reads filters
 # that flapping out while still catching genuine updates within N*CHECK_INTERVAL.
-CONFIRMATIONS_REQUIRED: int = _as_int(_cfg("CONFIRMATIONS_REQUIRED", "ConfirmationsRequired"), 2)
+CONFIRMATIONS_REQUIRED: int = _as_int(cfg.get("ConfirmationsRequired"), 2)
 
 # ── guild storage helpers ──────────────────────────────────────────────────────
 # guilds.json schema (updated):
