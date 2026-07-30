@@ -1,0 +1,21 @@
+{
+  "1429122689129251046": {
+    "apps": {
+      "7190422614401072": {
+        "name": "Animal Company",
+        "last_live": "1.84.3.3282",
+        "last_dev": "1.84.3.3282",
+        "last_live_at": "2026-07-30T06:49:22.875841+00:00",
+        "last_dev_at": "2026-07-30T06:28:00.552788+00:00",
+        "dev_builds_since_live": 0,
+        "pending_live": null,
+        "pending_live_count": 0,
+        "pending_dev": null,
+        "pending_dev_count": 0
+      }
+    },
+    "ping_role_live": 1461876806104908031,
+    "ping_role_dev": 1506056799495655484,
+    "channel_id": 1505409998333939722
+  }
+}
