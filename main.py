@@ -47,7 +47,7 @@ BOT_TOKEN: str      = os.environ.get("BOT_TOKEN") or cfg.get("BotToken", "")
 CHECK_INTERVAL: int = _as_int(cfg.get("CheckInterval"), 60)
 OWNER_IDS: set[int] = {int(x) for x in cfg.get("OwnerIDs", [])}
 
-GQL_URL = "https://graph.oculus.com/graphql"
+GQL_URL = os.environ.get("GQL_URL") or "https://graph.oculus.com/graphql"
 VERSION_DOC_ID = cfg.get("DocID", 6771539532935162)
 
 if not BOT_TOKEN:
