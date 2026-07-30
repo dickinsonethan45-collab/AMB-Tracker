@@ -164,8 +164,11 @@ class GraphQLClient:
             self._session = aiohttp.ClientSession(timeout=self._timeout)
         try:
             async with self._session.post(GQL_URL, data=payload) as r:
-                r.raise_for_status()
-                return await r.json(content_type=None)
+                body_text = await r.text()
+                if r.status != 200:
+                    print(f"[GQL] HTTP {r.status} body: {body_text[:1000]}")
+                    return None
+                return json.loads(body_text)
         except Exception as e:
             print(f"[GQL] {type(e).__name__}: {e}")
             if self._session and not self._session.closed:
