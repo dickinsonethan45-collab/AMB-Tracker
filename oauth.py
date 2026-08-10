@@ -7,9 +7,10 @@ Discord bots can't see another user's connections just because they're
 in a server together — that data is only accessible via OAuth2 with the
 "connections" scope, which requires the user to click through Discord's
 own authorize screen once. That part can't be skipped. Everything after
-it, though, happens back inside Discord: this sends the result as a DM
-from the bot rather than showing it on a webpage, and the page itself
-just bounces the browser back to Discord.
+it happens back inside Discord: the result is delivered as an ephemeral
+follow-up to the original /link command (so it lands in whatever channel
+they ran /link in, and only they can see it), and the webpage itself just
+bounces the browser back to Discord.
 """
 
 import secrets
@@ -20,18 +21,21 @@ from aiohttp import web, ClientSession
 import config
 import storage
 
-# state -> {"discord_id": ..., "expires": ...}
+# state -> {"discord_id", "application_id", "token", "expires"}
 _pending_states = {}
 
-STATE_TTL_SECONDS = 600  # 10 minutes to complete the OAuth flow
+# Discord interaction tokens are valid for follow-ups for 15 minutes.
+STATE_TTL_SECONDS = 600  # keep our own OAuth window comfortably under that
 
 DISCORD_API = "https://discord.com/api/v10"
 
 
-def build_authorize_url(discord_id: str) -> str:
+def build_authorize_url(discord_id: str, application_id: str, interaction_token: str) -> str:
     state = secrets.token_urlsafe(24)
     _pending_states[state] = {
         "discord_id": discord_id,
+        "application_id": application_id,
+        "token": interaction_token,
         "expires": time.time() + STATE_TTL_SECONDS,
     }
     return (
@@ -70,10 +74,21 @@ async def _fetch_connections(access_token: str, session: ClientSession):
     return await resp.json()
 
 
-async def _dm_user(discord_id: str, embed: dict, session: ClientSession):
-    """Send a DM from the bot to this user. Returns True on success."""
-    bot_headers = {"Authorization": f"Bot {config.BOT_TOKEN}"}
+async def _send_ephemeral_followup(application_id: str, token: str, embed: dict, session: ClientSession) -> bool:
+    """
+    Sends an ephemeral follow-up message to the original /link interaction.
+    Lands in the same channel /link was run in, visible only to that user.
+    """
+    resp = await session.post(
+        f"{DISCORD_API}/webhooks/{application_id}/{token}",
+        json={"embeds": [embed], "flags": 64},  # 64 = EPHEMERAL
+    )
+    return resp.status < 400
 
+
+async def _dm_user_fallback(discord_id: str, embed: dict, session: ClientSession) -> bool:
+    """Used only if the interaction token has expired (>15 min since /link)."""
+    bot_headers = {"Authorization": f"Bot {config.BOT_TOKEN}"}
     dm_resp = await session.post(
         f"{DISCORD_API}/users/@me/channels",
         json={"recipient_id": discord_id},
@@ -82,7 +97,6 @@ async def _dm_user(discord_id: str, embed: dict, session: ClientSession):
     if dm_resp.status >= 400:
         return False
     dm_channel = await dm_resp.json()
-
     msg_resp = await session.post(
         f"{DISCORD_API}/channels/{dm_channel['id']}/messages",
         json={"embeds": [embed]},
@@ -91,19 +105,16 @@ async def _dm_user(discord_id: str, embed: dict, session: ClientSession):
     return msg_resp.status < 400
 
 
-def _bounce_page(dm_sent: bool) -> str:
+def _bounce_page(delivered: bool) -> str:
     """
     Minimal page shown for the ~1 second it takes to redirect back to
     Discord — not a destination page, just a bridge.
     """
-    if dm_sent:
-        message = "Linked — check your DMs. Taking you back to Discord..."
-        redirect_js = '<script>setTimeout(function(){ window.location.href = "https://discord.com/channels/@me"; }, 900);</script>'
+    if delivered:
+        message = "Linked! Taking you back to Discord..."
+        redirect_js = '<script>setTimeout(function(){ window.location.href = "https://discord.com/channels/@me"; }, 800);</script>'
     else:
-        message = (
-            "Linked, but I couldn't DM you the result — you likely have DMs from server "
-            "members turned off. Run <code>/tree</code> in the server to see what got linked."
-        )
+        message = "Linked, but I couldn't message you the result — run <code>/tree</code> in the server to check."
         redirect_js = ""
     return f"""<!DOCTYPE html>
 <html><head><title>Linking...</title>
@@ -198,9 +209,13 @@ async def handle_callback(request: web.Request):
                 "color": 0x57F287,
             }
 
-        dm_sent = await _dm_user(discord_id, embed, session)
+        delivered = await _send_ephemeral_followup(
+            pending["application_id"], pending["token"], embed, session
+        )
+        if not delivered:
+            delivered = await _dm_user_fallback(discord_id, embed, session)
 
-    return web.Response(text=_bounce_page(dm_sent), content_type="text/html")
+    return web.Response(text=_bounce_page(delivered), content_type="text/html")
 
 
 def build_app() -> web.Application:
