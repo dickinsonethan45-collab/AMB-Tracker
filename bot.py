@@ -76,8 +76,9 @@ async def link(interaction: discord.Interaction):
     view.add_item(discord.ui.Button(label="Authorize on Discord", style=discord.ButtonStyle.link, url=url))
 
     await interaction.response.send_message(
-        "Click below and authorize — I'll pull your YouTube/TikTok straight from your "
-        "Discord **Settings -> Connections**. Make sure they're added there first.",
+        "Click below and authorize — you'll get bounced straight back to Discord, and I'll "
+        "DM you what I found. Make sure your YouTube/TikTok are added under Discord "
+        "**Settings -> Connections** first.",
         view=view,
         ephemeral=True,
     )
