@@ -13,13 +13,13 @@ packages in requirements.txt
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
 
 import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 import config
 import oauth
@@ -36,6 +36,7 @@ class TreeBot(commands.Bot):
         await self.tree.sync()
         self.loop.create_task(oauth.run_web_server())
         log.info("OAuth web server starting on %s:%s", config.WEB_SERVER_HOST, config.WEB_SERVER_PORT)
+        check_streak_expirations.start()
 
 
 bot = TreeBot(command_prefix="!", intents=intents)
@@ -335,22 +336,21 @@ async def get_youtube_video_details(video_id: str):
     return {"channel_name": channel_name, "published_at": published_at}
 
 
-# ---------- Per-platform cooldown + streak reset ----------
+# ---------- Per-platform cooldown ----------
 # Posting on TikTok locks TikTok for 24h but doesn't touch YouTube (and vice
-# versa) — same-day posts on both platforms still count as two growth events,
-# per the original design. If NEITHER platform gets a post within 25h of the
-# last one, the tree resets to level 1.
-#
-# These timestamps (last_tiktok_post_ts / last_youtube_post_ts) are tracked
-# here in main.py, separate from whatever staleness logic already lives in
-# storage.grow_tree()/storage.check_and_reset_if_stale() — I don't have
-# storage.py, so I can't merge this into it. If that file already tracks its
-# own "last posted" timestamp, send it over and I'll fold these into one
-# system instead of running two in parallel.
+# versa) — same-day posts on both platforms still count as two growth
+# events, per the original design. The overall streak-reset clock (going
+# quiet on BOTH platforms) is handled entirely by storage.py now, via
+# last_growth_time + config.GROWTH_WINDOW_HOURS — that used to be
+# duplicated here with its own hardcoded 25h timer and its own
+# last_tiktok_post_ts/last_youtube_post_ts timestamps, which could
+# disagree with storage.py's clock. That duplicate has been removed;
+# storage.check_and_reset_if_stale() is now the single source of truth for
+# "has this streak gone stale."
 
 PLATFORM_COOLDOWN_SECONDS = 24 * 60 * 60
-STREAK_RESET_SECONDS = 25 * 60 * 60
 VIDEO_MAX_AGE_SECONDS = 24 * 60 * 60
+STREAK_WARNING_SECONDS = 5 * 60  # DM a warning when this close to the reset
 
 
 def tiktok_video_timestamp(video_id: str):
@@ -371,27 +371,85 @@ def format_remaining(seconds: float) -> str:
     return f"{hours}h {minutes}m" if hours else f"{minutes}m"
 
 
-def most_recent_post_ts(entry: dict):
-    timestamps = [
-        entry.get("last_tiktok_post_ts"),
-        entry.get("last_youtube_post_ts"),
-    ]
-    timestamps = [t for t in timestamps if t is not None]
-    return max(timestamps) if timestamps else None
+def seconds_until_stale(entry: dict) -> float | None:
+    """Seconds left before storage.py's own staleness clock resets this
+    streak — mirrors the math in storage.check_and_reset_if_stale() so the
+    expiry-DM warning fires against the exact same deadline the reset
+    itself uses, instead of a second, possibly-disagreeing clock."""
+    last_iso = entry.get("last_growth_time")
+    if not last_iso:
+        return None
+    last_dt = datetime.fromisoformat(last_iso)
+    if last_dt.tzinfo is None:
+        last_dt = last_dt.replace(tzinfo=timezone.utc)
+    elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
+    return config.GROWTH_WINDOW_HOURS * 3600 - elapsed
 
 
-def reset_if_stale(entry: dict) -> bool:
-    """If 25h+ passed since the last post on either platform, resets the
-    tree to level 1 and clears both cooldowns. Returns True if it reset."""
-    last_ts = most_recent_post_ts(entry)
-    if last_ts is None:
+# ---------- Streak-expiry DM warning ----------
+# Every minute, scans everyone and DMs anyone sitting inside the last 5
+# minutes before storage.py's staleness reset fires. "expiry_warned_for_ts"
+# remembers *which* last_growth_time already got a warning, so a person
+# only gets one DM per streak — not one every minute until they post again
+# or it resets. Posting again changes last_growth_time, which naturally
+# un-matches the stored value, so the next close call warns again with no
+# extra code needed.
+
+async def send_streak_expiry_dm(discord_id: str, level: int) -> bool:
+    try:
+        user = await bot.fetch_user(int(discord_id))
+    except (ValueError, discord.NotFound):
         return False
-    if time.time() - last_ts >= STREAK_RESET_SECONDS:
-        entry["tree_level"] = 1
-        entry["last_tiktok_post_ts"] = None
-        entry["last_youtube_post_ts"] = None
+    embed = discord.Embed(
+        title=f"Your Streak Of {level} Is About To Expire",
+        description=(
+            "Post a video and do `/posted` with YouTube, TikTok, or both "
+            "to keep your streak going!"
+        ),
+        color=discord.Color.orange(),
+    )
+    try:
+        await user.send(embed=embed)
         return True
-    return False
+    except discord.Forbidden:
+        log.info("Can't DM %s for streak warning — DMs closed.", discord_id)
+        return False
+    except discord.HTTPException:
+        log.exception("Failed sending streak-expiry DM to %s", discord_id)
+        return False
+
+
+@tasks.loop(seconds=60)
+async def check_streak_expirations():
+    data = storage.load()
+    users = data["users"]
+    changed = False
+
+    for discord_id, entry in users.items():
+        level = entry.get("tree_level", 0)
+        if level <= 0:
+            continue
+
+        remaining = seconds_until_stale(entry)
+        if remaining is None or remaining <= 0:
+            continue  # no streak yet, or already stale — check_and_reset_if_stale() handles that
+
+        last_growth_time = entry.get("last_growth_time")
+        already_warned_for = entry.get("expiry_warned_for_ts")
+        if remaining <= STREAK_WARNING_SECONDS and already_warned_for != last_growth_time:
+            if await send_streak_expiry_dm(discord_id, level):
+                entry["expiry_warned_for_ts"] = last_growth_time
+                changed = True
+
+    if changed:
+        storage.save(data)
+
+
+
+
+@check_streak_expirations.before_loop
+async def before_check_streak_expirations():
+    await bot.wait_until_ready()
 
 
 # ---------- Slash commands ----------
@@ -443,7 +501,7 @@ async def posted(interaction: discord.Interaction, platform: app_commands.Choice
     data = storage.load()
     entry = storage.get_user(data, str(interaction.user.id))
 
-    if reset_if_stale(entry):
+    if storage.check_and_reset_if_stale(entry):
         storage.save(data)
 
     linked_field = "youtube_username" if platform.value == "youtube" else "tiktok_username"
@@ -537,8 +595,7 @@ async def tree_cmd(interaction: discord.Interaction):
     data = storage.load()
     entry = storage.get_user(data, str(interaction.user.id))
 
-    stale = reset_if_stale(entry)
-    if storage.check_and_reset_if_stale(entry) or stale:
+    if storage.check_and_reset_if_stale(entry):
         storage.save(data)
 
     embed = build_tree_embed(interaction.user, entry)
