@@ -174,10 +174,12 @@ async def handle_callback(request: web.Request):
             )
 
         youtube_name = None
+        youtube_channel_id = None
         tiktok_name = None
         for conn in connections:
             if conn.get("type") == "youtube":
                 youtube_name = conn.get("name")
+                youtube_channel_id = conn.get("id")  # Discord: id = channel ID for youtube
             elif conn.get("type") == "tiktok":
                 tiktok_name = conn.get("name")
 
@@ -185,6 +187,7 @@ async def handle_callback(request: web.Request):
         entry = storage.get_user(data, discord_id)
         if youtube_name:
             entry["youtube_username"] = youtube_name
+            entry["youtube_channel_id"] = youtube_channel_id
         if tiktok_name:
             entry["tiktok_username"] = tiktok_name
         storage.save(data)
