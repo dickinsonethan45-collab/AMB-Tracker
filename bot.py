@@ -14,6 +14,7 @@ import logging
 import re
 from urllib.parse import urlparse, parse_qs
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -222,6 +223,40 @@ def mark_url_used(data: dict, dedupe_key: str, discord_id: str):
     data.setdefault("used_urls", {})[dedupe_key] = discord_id
 
 
+async def get_youtube_video_channel_id(video_id: str):
+    """
+    Looks up a video via the YouTube Data API and returns its channelId.
+    Returns None if the lookup failed for any reason (bad/missing API key,
+    video deleted/private, network error) — caller decides how to handle that.
+    Requires config.YOUTUBE_API_KEY (get one free from Google Cloud Console:
+    enable "YouTube Data API v3" on a project, then create an API key —
+    no OAuth needed since this only reads public video data).
+    """
+    api_key = getattr(config, "YOUTUBE_API_KEY", None)
+    if not api_key:
+        log.warning("config.YOUTUBE_API_KEY is not set — can't verify YouTube video ownership.")
+        return None
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            resp = await session.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                params={"part": "snippet", "id": video_id, "key": api_key},
+            )
+            if resp.status != 200:
+                log.warning("YouTube API returned %s for video %s", resp.status, video_id)
+                return None
+            payload = await resp.json()
+        except Exception:
+            log.exception("YouTube API lookup failed for video %s", video_id)
+            return None
+
+    items = payload.get("items") or []
+    if not items:
+        return None
+    return items[0]["snippet"]["channelId"]
+
+
 # ---------- Slash commands ----------
 
 @bot.tree.command(name="link", description="Link your YouTube/TikTok from your Discord Connections.")
@@ -282,6 +317,24 @@ async def posted(interaction: discord.Interaction, platform: app_commands.Choice
     if error:
         await interaction.response.send_message(f"⚠️ {error}", ephemeral=True)
         return
+
+    if platform.value == "youtube":
+        video_id = dedupe_key.split(":", 1)[1]
+        channel_id = await get_youtube_video_channel_id(video_id)
+        if channel_id is None:
+            await interaction.response.send_message(
+                "⚠️ Couldn't verify that video against YouTube right now — try again in a bit.",
+                ephemeral=True,
+            )
+            return
+        if channel_id != entry.get("youtube_channel_id"):
+            await interaction.response.send_message(
+                f"⚠️ That video isn't from your linked YouTube channel "
+                f"({entry.get('youtube_username')}). You can only submit videos from "
+                "your own linked account.",
+                ephemeral=True,
+            )
+            return
 
     used_by = url_already_used(data, dedupe_key)
     if used_by is not None:
