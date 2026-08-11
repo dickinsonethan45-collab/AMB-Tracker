@@ -12,6 +12,7 @@ packages in requirements.txt
 
 import logging
 import re
+import time
 from urllib.parse import urlparse, parse_qs
 
 import aiohttp
@@ -257,6 +258,52 @@ async def get_youtube_video_channel_id(video_id: str):
     return items[0]["snippet"]["channelId"]
 
 
+# ---------- Per-platform cooldown + streak reset ----------
+# Posting on TikTok locks TikTok for 24h but doesn't touch YouTube (and vice
+# versa) — same-day posts on both platforms still count as two growth events,
+# per the original design. If NEITHER platform gets a post within 25h of the
+# last one, the tree resets to level 1.
+#
+# These timestamps (last_tiktok_post_ts / last_youtube_post_ts) are tracked
+# here in main.py, separate from whatever staleness logic already lives in
+# storage.grow_tree()/storage.check_and_reset_if_stale() — I don't have
+# storage.py, so I can't merge this into it. If that file already tracks its
+# own "last posted" timestamp, send it over and I'll fold these into one
+# system instead of running two in parallel.
+
+PLATFORM_COOLDOWN_SECONDS = 24 * 60 * 60
+STREAK_RESET_SECONDS = 25 * 60 * 60
+
+
+def format_remaining(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, minutes = divmod(seconds // 60, 60)
+    return f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+
+def most_recent_post_ts(entry: dict):
+    timestamps = [
+        entry.get("last_tiktok_post_ts"),
+        entry.get("last_youtube_post_ts"),
+    ]
+    timestamps = [t for t in timestamps if t is not None]
+    return max(timestamps) if timestamps else None
+
+
+def reset_if_stale(entry: dict) -> bool:
+    """If 25h+ passed since the last post on either platform, resets the
+    tree to level 1 and clears both cooldowns. Returns True if it reset."""
+    last_ts = most_recent_post_ts(entry)
+    if last_ts is None:
+        return False
+    if time.time() - last_ts >= STREAK_RESET_SECONDS:
+        entry["tree_level"] = 1
+        entry["last_tiktok_post_ts"] = None
+        entry["last_youtube_post_ts"] = None
+        return True
+    return False
+
+
 # ---------- Slash commands ----------
 
 @bot.tree.command(name="link", description="Link your YouTube/TikTok from your Discord Connections.")
@@ -306,12 +353,27 @@ async def posted(interaction: discord.Interaction, platform: app_commands.Choice
     data = storage.load()
     entry = storage.get_user(data, str(interaction.user.id))
 
+    if reset_if_stale(entry):
+        storage.save(data)
+
     linked_field = "youtube_username" if platform.value == "youtube" else "tiktok_username"
     if not entry.get(linked_field):
         await interaction.response.send_message(
             f"You haven't linked {platform.name} yet — run `/link` first.", ephemeral=True
         )
         return
+
+    last_ts = entry.get(f"last_{platform.value}_post_ts")
+    if last_ts is not None:
+        elapsed = time.time() - last_ts
+        if elapsed < PLATFORM_COOLDOWN_SECONDS:
+            remaining = format_remaining(PLATFORM_COOLDOWN_SECONDS - elapsed)
+            await interaction.response.send_message(
+                f"⚠️ You already grew your tree with {platform.name} recently — you can use "
+                f"{platform.name} again in **{remaining}**. (The other platform isn't affected.)",
+                ephemeral=True,
+            )
+            return
 
     dedupe_key, error = validate_posted_url(platform.value, url, entry)
     if error:
@@ -345,6 +407,7 @@ async def posted(interaction: discord.Interaction, platform: app_commands.Choice
         return
 
     level = storage.grow_tree(entry)
+    entry[f"last_{platform.value}_post_ts"] = time.time()
     mark_url_used(data, dedupe_key, str(interaction.user.id))
     storage.save(data)
 
@@ -359,7 +422,8 @@ async def tree_cmd(interaction: discord.Interaction):
     data = storage.load()
     entry = storage.get_user(data, str(interaction.user.id))
 
-    if storage.check_and_reset_if_stale(entry):
+    stale = reset_if_stale(entry)
+    if storage.check_and_reset_if_stale(entry) or stale:
         storage.save(data)
 
     embed = build_tree_embed(interaction.user.display_name, entry)
