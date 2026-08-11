@@ -153,6 +153,14 @@ def clean_handle(name: str) -> str:
     return (name or "").strip().lstrip("@").lower()
 
 
+def normalize_for_match(name: str) -> str:
+    """Looser than clean_handle: strips everything but letters/digits and
+    lowercases. Meant to absorb emoji, punctuation, or spacing differences
+    between what Discord reports for a linked account and what a platform's
+    own page/oEmbed reports for the same account."""
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
 def validate_posted_url(platform_value: str, url: str, entry: dict):
     """Returns (dedupe_key, None) on success, or (None, error_message) on failure."""
     if not url or not url.strip():
@@ -422,10 +430,15 @@ async def posted(interaction: discord.Interaction, platform: app_commands.Choice
                 ephemeral=True,
             )
             return
-        if clean_handle(details["channel_name"]) != clean_handle(entry.get("youtube_username")):
+        linked_name = entry.get("youtube_username")
+        log.info(
+            "YouTube ownership check for video %s: oEmbed channel=%r, linked=%r",
+            video_id, details["channel_name"], linked_name,
+        )
+        if normalize_for_match(details["channel_name"]) != normalize_for_match(linked_name):
             await interaction.response.send_message(
                 f"⚠️ That video isn't from your linked YouTube channel "
-                f"({entry.get('youtube_username')}). You can only submit videos from "
+                f"({linked_name}). You can only submit videos from "
                 "your own linked account.",
                 ephemeral=True,
             )
