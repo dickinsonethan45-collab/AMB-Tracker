@@ -10,6 +10,7 @@ Requires: config.py filled in (via environment variables), and the
 packages in requirements.txt
 """
 
+import io
 import logging
 import re
 import time
@@ -21,6 +22,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import card
 import config
 import oauth
 import storage
@@ -42,67 +44,57 @@ bot = TreeBot(command_prefix="!", intents=intents)
 
 
 # ---------- Tree visuals ----------
-# Tiers are (min_level, name, art) — art is plain text, rendered inside a
-# ``` code block so spacing lines up regardless of client font.
+# The actual tree art (procedural, PNG) lives in card.py — that's also the
+# single source of truth for tier thresholds/names/colors now, so there's
+# no second TREE_TIERS list here to drift out of sync with it.
 
-TREE_TIERS = [
-    (0, "No Tree Yet", "🌰\n\nPost your first video to plant one!"),
-    (1, "Seedling", "  🌱\n  ||"),
-    (10, "Sprout", "   🌿\n  🌿🌿\n   ||"),
-    (50, "Sapling", "    🌳\n   🌳🌳🌳\n    |||"),
-    (150, "Young Tree", "     🌳🌳\n    🌳🌳🌳🌳\n   🌳🌳🌳🌳🌳🌳\n      |||"),
-    (400, "Mature Tree", "      🌲🌲🌲\n     🌲🌲🌲🌲🌲\n    🌲🌲🌲🌲🌲🌲🌲\n       |||||"),
-    (800, "Ancient Tree", "       🌲🌲🌲🌲🌲\n      🌲🌲🌲🌲🌲🌲🌲\n     🌲🌲🌲🌲🌲🌲🌲🌲🌲\n        |||||||"),
-    (1000, "MAX — Legendary Tree", "    ✨ 🌟 ✨\n   🌳🌳🌳🌳🌳🌳🌳\n  🌳🌳🌳🌳🌳🌳🌳🌳🌳\n 🌳🌳🌳🌳🌳🌳🌳🌳🌳🌳🌳\n     |||||||\n    ⭐ MAX LEVEL ⭐"),
-]
+_AVATAR_CACHE: dict[str, bytes] = {}
 
 
-def get_tier(level: int):
-    """Returns (name, art) for the highest tier this level qualifies for."""
-    current = TREE_TIERS[0]
-    for threshold, name, art in TREE_TIERS:
-        if level >= threshold:
-            current = (threshold, name, art)
-        else:
-            break
-    return current[1], current[2]
+async def fetch_avatar_bytes(user: discord.abc.User, session: aiohttp.ClientSession) -> bytes:
+    url = user.display_avatar.replace(size=256, format="png").url
+    cached = _AVATAR_CACHE.get(url)
+    if cached is not None:
+        return cached
+    async with session.get(url) as resp:
+        resp.raise_for_status()
+        data = await resp.read()
+    _AVATAR_CACHE[url] = data
+    return data
 
 
-def progress_bar(level: int, max_level: int = None, length: int = 12) -> str:
-    max_level = max_level or config.MAX_TREE_LEVEL
-    filled = round(length * min(level, max_level) / max_level)
-    pct = round(100 * min(level, max_level) / max_level)
-    return f"{'▰' * filled}{'▱' * (length - filled)}  {pct}%"
+def compute_global_rank(data: dict, discord_id: str) -> int | None:
+    """1-indexed rank by tree_level, descending. None if this user has no
+    tree yet (level 0) or isn't in storage."""
+    users = data.get("users", {})
+    entry = users.get(discord_id)
+    if not entry or entry.get("tree_level", 0) <= 0:
+        return None
+    levels = sorted((u.get("tree_level", 0) for u in users.values()), reverse=True)
+    return levels.index(entry["tree_level"]) + 1
 
 
-def tier_color(level: int) -> discord.Color:
-    if level >= config.MAX_TREE_LEVEL:
-        return discord.Color.gold()
-    if level >= 400:
-        return discord.Color.dark_green()
-    if level >= 50:
-        return discord.Color.green()
-    if level >= 1:
-        return discord.Color.from_rgb(144, 238, 144)
-    return discord.Color.light_gray()
+async def build_tree_card_file(user: discord.abc.User, entry: dict, data: dict) -> discord.File:
+    async with aiohttp.ClientSession() as session:
+        avatar_bytes = await fetch_avatar_bytes(user, session)
+    level = entry.get("tree_level", 0)
+    png_bytes = card.render_tree_card(
+        display_name=user.display_name,
+        avatar_bytes=avatar_bytes,
+        level=level,
+        max_level=config.MAX_TREE_LEVEL,
+        streak_days=level,  # each growth event = one "day" in the streak, per the level counter itself
+        global_rank=compute_global_rank(data, str(user.id)),
+        seed=int(user.id) & 0xFFFF,
+    )
+    return discord.File(io.BytesIO(png_bytes), filename="tree_card.png")
 
 
 def build_tree_embed(display_name: str, entry: dict) -> discord.Embed:
-    level = entry.get("tree_level", 0)
-    tier_name, art = get_tier(level)
-
-    embed = discord.Embed(
-        title=f"{display_name}'s Tree — {tier_name}",
-        description=f"```\n{art}\n```",
-        color=tier_color(level),
-    )
-    embed.add_field(name="Level", value=f"**{level} / {config.MAX_TREE_LEVEL}**", inline=True)
-    embed.add_field(
-        name="Streak",
-        value=f"🔥 {level} day{'s' if level != 1 else ''}" if level > 0 else "No active streak",
-        inline=True,
-    )
-    embed.add_field(name="Progress", value=progress_bar(level), inline=False)
+    """Small embed that wraps the tree card image with linked-account info
+    (the card itself doesn't have room for that)."""
+    embed = discord.Embed(color=discord.Color.dark_theme())
+    embed.set_image(url="attachment://tree_card.png")
 
     linked = []
     if entry.get("youtube_username"):
@@ -117,13 +109,11 @@ def build_tree_embed(display_name: str, entry: dict) -> discord.Embed:
     return embed
 
 
-async def announce_growth(user: discord.abc.User, platform: str, level: int, url: str = None):
+async def announce_growth(user: discord.abc.User, platform: str, level: int, entry: dict, data: dict, url: str = None):
     channel = bot.get_channel(config.ALERT_CHANNEL_ID)
     if channel is None:
         log.warning("ALERT_CHANNEL_ID %s not found/visible to the bot.", config.ALERT_CHANNEL_ID)
         return
-
-    tier_name, art = get_tier(level)
 
     if level == 1:
         desc = f"{user.mention} posted on **{platform}** — a new tree just sprouted! 🌱"
@@ -132,11 +122,12 @@ async def announce_growth(user: discord.abc.User, platform: str, level: int, url
     else:
         desc = f"{user.mention} posted on **{platform}** — their tree grew to **Level {level}**!"
 
-    embed = discord.Embed(title=tier_name, description=f"{desc}\n```\n{art}\n```", color=tier_color(level))
-    embed.add_field(name="Progress", value=progress_bar(level), inline=False)
+    file = await build_tree_card_file(user, entry, data)
+    embed = discord.Embed(description=desc, color=discord.Color.dark_theme())
+    embed.set_image(url="attachment://tree_card.png")
     if url:
         embed.add_field(name="Video", value=url, inline=False)
-    await channel.send(embed=embed)
+    await channel.send(embed=embed, file=file)
 
 
 # ---------- Video URL validation ----------
@@ -476,10 +467,11 @@ async def posted(interaction: discord.Interaction, platform: app_commands.Choice
     mark_url_used(data, dedupe_key, str(interaction.user.id))
     storage.save(data)
 
+    file = await build_tree_card_file(interaction.user, entry, data)
     await interaction.response.send_message(
-        f"Nice! Your tree grew to **Level {level}** 🌳", ephemeral=True
+        f"Nice! Your tree grew to **Level {level}** 🌳", file=file, ephemeral=True
     )
-    await announce_growth(interaction.user, platform.name, level, url)
+    await announce_growth(interaction.user, platform.name, level, entry, data, url)
 
 
 @bot.tree.command(name="tree", description="Check your tree.")
@@ -491,8 +483,9 @@ async def tree_cmd(interaction: discord.Interaction):
     if storage.check_and_reset_if_stale(entry) or stale:
         storage.save(data)
 
+    file = await build_tree_card_file(interaction.user, entry, data)
     embed = build_tree_embed(interaction.user.display_name, entry)
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, file=file)
 
 
 if __name__ == "__main__":
