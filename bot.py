@@ -13,6 +13,7 @@ packages in requirements.txt
 import logging
 import re
 import time
+from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
 import aiohttp
@@ -224,38 +225,56 @@ def mark_url_used(data: dict, dedupe_key: str, discord_id: str):
     data.setdefault("used_urls", {})[dedupe_key] = discord_id
 
 
-async def get_youtube_video_channel_id(video_id: str):
+async def get_youtube_video_details(video_id: str):
     """
-    Looks up a video via the YouTube Data API and returns its channelId.
-    Returns None if the lookup failed for any reason (bad/missing API key,
-    video deleted/private, network error) — caller decides how to handle that.
-    Requires config.YOUTUBE_API_KEY (get one free from Google Cloud Console:
-    enable "YouTube Data API v3" on a project, then create an API key —
-    no OAuth needed since this only reads public video data).
+    No API key needed. Two free lookups:
+      - YouTube's public oEmbed endpoint gives the channel's display name
+        (author_name) — no auth required, ever.
+      - The watch page itself embeds the upload timestamp in its page JSON
+        (publishDate/uploadDate) — scraped with a plain GET, same as how
+        yt-dlp and similar tools get it without the Data API.
+    Returns a dict with "channel_name" and "published_at" (epoch seconds,
+    may be None if that part couldn't be parsed), or None if the video
+    couldn't be found/reached at all.
     """
-    api_key = getattr(config, "YOUTUBE_API_KEY", None)
-    if not api_key:
-        log.warning("config.YOUTUBE_API_KEY is not set — can't verify YouTube video ownership.")
-        return None
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+    headers = {"User-Agent": "Mozilla/5.0"}
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(headers=headers) as session:
         try:
-            resp = await session.get(
-                "https://www.googleapis.com/youtube/v3/videos",
-                params={"part": "snippet", "id": video_id, "key": api_key},
+            oembed_resp = await session.get(
+                "https://www.youtube.com/oembed",
+                params={"url": watch_url, "format": "json"},
             )
-            if resp.status != 200:
-                log.warning("YouTube API returned %s for video %s", resp.status, video_id)
-                return None
-            payload = await resp.json()
         except Exception:
-            log.exception("YouTube API lookup failed for video %s", video_id)
+            log.exception("YouTube oEmbed request failed for video %s", video_id)
             return None
 
-    items = payload.get("items") or []
-    if not items:
-        return None
-    return items[0]["snippet"]["channelId"]
+        if oembed_resp.status != 200:
+            log.warning(
+                "YouTube oEmbed returned HTTP %s for video %s — deleted/private/bad id.",
+                oembed_resp.status, video_id,
+            )
+            return None
+
+        oembed_payload = await oembed_resp.json()
+        channel_name = oembed_payload.get("author_name")
+
+        published_at = None
+        try:
+            page_resp = await session.get(watch_url)
+            html = await page_resp.text()
+            match = re.search(r'"publishDate":"([^"]+)"', html) or re.search(
+                r'"uploadDate":"([^"]+)"', html
+            )
+            if match:
+                published_at = datetime.fromisoformat(match.group(1)).timestamp()
+            else:
+                log.warning("No publishDate/uploadDate found on watch page for video %s", video_id)
+        except Exception:
+            log.exception("Couldn't scrape upload date for video %s", video_id)
+
+    return {"channel_name": channel_name, "published_at": published_at}
 
 
 # ---------- Per-platform cooldown + streak reset ----------
@@ -273,6 +292,19 @@ async def get_youtube_video_channel_id(video_id: str):
 
 PLATFORM_COOLDOWN_SECONDS = 24 * 60 * 60
 STREAK_RESET_SECONDS = 25 * 60 * 60
+VIDEO_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+def tiktok_video_timestamp(video_id: str):
+    """
+    TikTok video IDs are Snowflake-style: the top 32 bits are the Unix
+    upload timestamp (in seconds). No API call needed. Returns None if the
+    ID doesn't parse as an int.
+    """
+    try:
+        return int(video_id) >> 32
+    except ValueError:
+        return None
 
 
 def format_remaining(seconds: float) -> str:
@@ -382,18 +414,38 @@ async def posted(interaction: discord.Interaction, platform: app_commands.Choice
 
     if platform.value == "youtube":
         video_id = dedupe_key.split(":", 1)[1]
-        channel_id = await get_youtube_video_channel_id(video_id)
-        if channel_id is None:
+        details = await get_youtube_video_details(video_id)
+        if details is None:
             await interaction.response.send_message(
-                "⚠️ Couldn't verify that video against YouTube right now — try again in a bit.",
+                "⚠️ Couldn't fetch that video from YouTube right now — double check the "
+                "link, or try again in a bit.",
                 ephemeral=True,
             )
             return
-        if channel_id != entry.get("youtube_channel_id"):
+        if clean_handle(details["channel_name"]) != clean_handle(entry.get("youtube_username")):
             await interaction.response.send_message(
                 f"⚠️ That video isn't from your linked YouTube channel "
                 f"({entry.get('youtube_username')}). You can only submit videos from "
                 "your own linked account.",
+                ephemeral=True,
+            )
+            return
+        published_at = details["published_at"]
+        if published_at is not None and time.time() - published_at > VIDEO_MAX_AGE_SECONDS:
+            await interaction.response.send_message(
+                "⚠️ That video was posted more than 24 hours ago — only videos from the "
+                "last 24 hours count.",
+                ephemeral=True,
+            )
+            return
+
+    else:  # tiktok
+        video_id = dedupe_key.split(":", 1)[1]
+        video_ts = tiktok_video_timestamp(video_id)
+        if video_ts is not None and time.time() - video_ts > VIDEO_MAX_AGE_SECONDS:
+            await interaction.response.send_message(
+                "⚠️ That video was posted more than 24 hours ago — only videos from the "
+                "last 24 hours count.",
                 ephemeral=True,
             )
             return
