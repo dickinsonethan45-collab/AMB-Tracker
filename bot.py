@@ -42,20 +42,32 @@ bot = TreeBot(command_prefix="!", intents=intents)
 
 
 # ---------- Tree visuals ----------
-# Tiers are (min_level, name, art, color) — art is plain text rendered in
-# a ``` code block so spacing lines up regardless of client font, color
-# drives the embed's side bar so it visibly shifts as you climb tiers.
+# Tiers are (min_level, name, color) — color drives the embed's side bar
+# so it visibly shifts as you climb tiers. The badge art in the code block
+# is generated separately (see build_badge_art) since it now scales
+# continuously with the exact level, not just per-tier.
 
 TREE_TIERS = [
-    (0, "No Tree Yet", "🌰\n\nPost your first video to plant one!", discord.Color.light_gray()),
-    (1, "Seedling", "   🌱\n   ||", discord.Color.from_rgb(144, 238, 144)),
-    (10, "Sprout", "   🌿\n  🌿🌿\n   ||", discord.Color.from_rgb(110, 220, 110)),
-    (50, "Sapling", "    🌳\n   🌳🌳🌳\n    |||", discord.Color.green()),
-    (150, "Young Tree", "     🌳🌳\n    🌳🌳🌳🌳\n   🌳🌳🌳🌳🌳🌳\n      |||", discord.Color.from_rgb(46, 160, 90)),
-    (400, "Mature Tree", "      🌲🌲🌲\n     🌲🌲🌲🌲🌲\n    🌲🌲🌲🌲🌲🌲🌲\n       |||||", discord.Color.dark_green()),
-    (800, "Ancient Tree", "       🌲🌲🌲🌲🌲\n      🌲🌲🌲🌲🌲🌲🌲\n     🌲🌲🌲🌲🌲🌲🌲🌲🌲\n        |||||||", discord.Color.from_rgb(30, 110, 90)),
-    (1000, "MAX — Legendary Tree", "    ✨ 🌟 ✨\n   🌳🌳🌳🌳🌳🌳🌳\n  🌳🌳🌳🌳🌳🌳🌳🌳🌳\n 🌳🌳🌳🌳🌳🌳🌳🌳🌳🌳🌳\n     |||||||\n    ⭐ MAX LEVEL ⭐", discord.Color.gold()),
+    (0, "No Tree Yet", discord.Color.from_rgb(46, 196, 182)),   # teal, not the old flat grey
+    (1, "Seedling", discord.Color.from_rgb(144, 238, 144)),
+    (10, "Sprout", discord.Color.from_rgb(110, 220, 110)),
+    (50, "Sapling", discord.Color.green()),
+    (150, "Young Tree", discord.Color.from_rgb(46, 160, 90)),
+    (400, "Mature Tree", discord.Color.dark_green()),
+    (800, "Ancient Tree", discord.Color.from_rgb(30, 110, 90)),
+    (1000, "MAX — Legendary Tree", discord.Color.gold()),
 ]
+
+TIER_EMOJI = {
+    "No Tree Yet": "🌰",
+    "Seedling": "🌱",
+    "Sprout": "🌿",
+    "Sapling": "🍀",
+    "Young Tree": "🌳",
+    "Mature Tree": "🌲",
+    "Ancient Tree": "🌴",
+    "MAX — Legendary Tree": "🌟",
+}
 
 TIER_FLAVOR = {
     "No Tree Yet": "Every legendary tree starts with a single video.",
@@ -70,25 +82,44 @@ TIER_FLAVOR = {
 
 
 def get_tier(level: int):
-    """Returns (name, art, color) for the highest tier this level qualifies for."""
+    """Returns (name, color) for the highest tier this level qualifies for."""
     current = TREE_TIERS[0]
-    for threshold, name, art, color in TREE_TIERS:
+    for threshold, name, color in TREE_TIERS:
         if level >= threshold:
-            current = (threshold, name, art, color)
+            current = (threshold, name, color)
         else:
             break
-    return current[1], current[2], current[3]
+    return current[1], current[2]
+
+
+def build_badge_art(level: int) -> str:
+    """Single-line emoji badge instead of the old sprawling multi-line
+    clusters — the emoji count scales with level (more emoji = bigger/
+    further along) and it stays a single row, so it can't go crooked in
+    Discord's code-block monospace font the way multi-line emoji art does
+    on some clients."""
+    tier_name, _color = get_tier(level)
+    emoji = TIER_EMOJI.get(tier_name, "🌱")
+
+    if level <= 0:
+        return f"{emoji}\n\nPost your first video to plant one!"
+
+    count = 1 + min(level // 120, 6)  # 1 emoji at level 1, up to 7 near max
+    row = (emoji + " ") * count
+    return f"{row.strip()}\n\nLEVEL {level}"
 
 
 def progress_bar(level: int, max_level: int = None, length: int = 14) -> str:
     max_level = max_level or config.MAX_TREE_LEVEL
     filled = round(length * min(level, max_level) / max_level)
-    pct = round(100 * min(level, max_level) / max_level)
+    # Scaled out of 1000 (i.e. out of max_level), not the usual out-of-100 —
+    # at max_level=1000 this just prints the level itself, e.g. "300%".
+    pct = round(1000 * min(level, max_level) / max_level)
     return f"{'▰' * filled}{'▱' * (length - filled)}  **{pct}%**"
 
 
 def next_tier_line(level: int) -> str:
-    for threshold, name, _art, _color in TREE_TIERS:
+    for threshold, name, _color in TREE_TIERS:
         if level < threshold:
             return f"**{threshold - level}** more to reach **{name}**"
     return "Max tier reached"
@@ -96,7 +127,8 @@ def next_tier_line(level: int) -> str:
 
 def build_tree_embed(user: discord.abc.User, entry: dict) -> discord.Embed:
     level = entry.get("tree_level", 0)
-    tier_name, art, color = get_tier(level)
+    tier_name, color = get_tier(level)
+    art = build_badge_art(level)
 
     embed = discord.Embed(
         title=f"🌳 {user.display_name}'s Tree",
@@ -134,7 +166,8 @@ async def announce_growth(user: discord.abc.User, platform: str, level: int, url
         log.warning("ALERT_CHANNEL_ID %s not found/visible to the bot.", config.ALERT_CHANNEL_ID)
         return
 
-    tier_name, art, color = get_tier(level)
+    tier_name, _color = get_tier(level)
+    art = build_badge_art(level)
 
     if level == 1:
         desc = f"{user.mention} posted on **{platform}** — a new tree just sprouted! 🌱"
@@ -146,7 +179,7 @@ async def announce_growth(user: discord.abc.User, platform: str, level: int, url
     embed = discord.Embed(
         title=f"{tier_name}",
         description=f"{desc}\n```\n{art}\n```",
-        color=color,
+        color=discord.Color.blue(),  # always blue for growth posts, regardless of tier color
     )
     embed.set_thumbnail(url=user.display_avatar.url)
     embed.add_field(name="Progress", value=progress_bar(level), inline=False)
