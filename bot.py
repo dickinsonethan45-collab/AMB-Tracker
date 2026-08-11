@@ -11,6 +11,8 @@ packages in requirements.txt
 """
 
 import logging
+import re
+from urllib.parse import urlparse, parse_qs
 
 import discord
 from discord import app_commands
@@ -134,6 +136,92 @@ async def announce_growth(user: discord.abc.User, platform: str, level: int, url
     await channel.send(embed=embed)
 
 
+# ---------- Video URL validation ----------
+# Makes sure a URL passed to /posted is an actual video (not a channel
+# link), belongs to the account the user linked, and hasn't already been
+# redeemed by anyone. Used URLs are stored as {platform}:{video_id} in
+# data["used_urls"] so it's permanent and global across users.
+
+TIKTOK_VIDEO_RE = re.compile(r"^/@(?P<user>[\w.\-]+)/video/(?P<video_id>\d+)/?$")
+YOUTUBE_SHORTS_RE = re.compile(r"^/shorts/(?P<video_id>[\w\-]{6,})/?$")
+
+
+def clean_handle(name: str) -> str:
+    return (name or "").strip().lstrip("@").lower()
+
+
+def validate_posted_url(platform_value: str, url: str, entry: dict):
+    """Returns (dedupe_key, None) on success, or (None, error_message) on failure."""
+    if not url or not url.strip():
+        return None, "You need to include a link to the video itself."
+
+    parsed = urlparse(url.strip())
+    host = (parsed.netloc or "").lower().removeprefix("www.").removeprefix("m.")
+    path = parsed.path or ""
+
+    if platform_value == "tiktok":
+        if host != "tiktok.com":
+            return None, "That doesn't look like a tiktok.com link."
+
+        match = TIKTOK_VIDEO_RE.match(path)
+        if not match:
+            return None, (
+                "That's not a video link — it looks like a channel/profile link "
+                "(or a shortened link). Open the video in the TikTok app, hit "
+                "Share -> Copy Link, and use that full "
+                "`tiktok.com/@username/video/...` URL."
+            )
+
+        url_user = clean_handle(match.group("user"))
+        linked_user = clean_handle(entry.get("tiktok_username"))
+        if url_user != linked_user:
+            return None, (
+                f"That video is from @{match.group('user')}, but your linked "
+                f"TikTok account is @{entry.get('tiktok_username')}. You can only "
+                "submit videos from your own linked account."
+            )
+
+        return f"tiktok:{match.group('video_id')}", None
+
+    if platform_value == "youtube":
+        if host not in ("youtube.com", "youtu.be"):
+            return None, "That doesn't look like a youtube.com or youtu.be link."
+
+        video_id = None
+        if host == "youtu.be":
+            video_id = path.strip("/").split("/")[0] or None
+        elif path == "/watch":
+            video_id = parse_qs(parsed.query).get("v", [None])[0]
+        else:
+            shorts_match = YOUTUBE_SHORTS_RE.match(path)
+            if shorts_match:
+                video_id = shorts_match.group("video_id")
+
+        if not video_id:
+            return None, (
+                "That's not a video link — it looks like a channel link (or "
+                "something else). Use the full video URL from the Share button "
+                "(`youtube.com/watch?v=...`, `youtu.be/...`, or "
+                "`youtube.com/shorts/...`)."
+            )
+
+        # NOTE: unlike TikTok, a YouTube video URL never contains the channel
+        # name, so we can't confirm this specific video belongs to the linked
+        # channel from the URL alone — that needs a YouTube Data API lookup
+        # (video -> channelId) which isn't wired up here.
+        return f"youtube:{video_id}", None
+
+    return None, "Unknown platform."
+
+
+def url_already_used(data: dict, dedupe_key: str):
+    return data.setdefault("used_urls", {}).get(dedupe_key)
+
+
+def mark_url_used(data: dict, dedupe_key: str, discord_id: str):
+    data.setdefault("used_urls", {})[dedupe_key] = discord_id
+
+
 # ---------- Slash commands ----------
 
 @bot.tree.command(name="link", description="Link your YouTube/TikTok from your Discord Connections.")
@@ -174,12 +262,12 @@ async def unlink(interaction: discord.Interaction, platform: app_commands.Choice
 
 
 @bot.tree.command(name="posted", description="Tell the bot you just posted a video, to grow your tree.")
-@app_commands.describe(platform="Which platform you posted on", url="Optional link to the video")
+@app_commands.describe(platform="Which platform you posted on", url="Link to the video (required)")
 @app_commands.choices(platform=[
     app_commands.Choice(name="YouTube", value="youtube"),
     app_commands.Choice(name="TikTok", value="tiktok"),
 ])
-async def posted(interaction: discord.Interaction, platform: app_commands.Choice[str], url: str = None):
+async def posted(interaction: discord.Interaction, platform: app_commands.Choice[str], url: str):
     data = storage.load()
     entry = storage.get_user(data, str(interaction.user.id))
 
@@ -190,7 +278,21 @@ async def posted(interaction: discord.Interaction, platform: app_commands.Choice
         )
         return
 
+    dedupe_key, error = validate_posted_url(platform.value, url, entry)
+    if error:
+        await interaction.response.send_message(f"⚠️ {error}", ephemeral=True)
+        return
+
+    used_by = url_already_used(data, dedupe_key)
+    if used_by is not None:
+        await interaction.response.send_message(
+            "That video's already been used to grow a tree — each video only counts once.",
+            ephemeral=True,
+        )
+        return
+
     level = storage.grow_tree(entry)
+    mark_url_used(data, dedupe_key, str(interaction.user.id))
     storage.save(data)
 
     await interaction.response.send_message(
